@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "navicoos-remote-client"
+version = "0.1.0"
+description = "A native macOS remote display and control client for B&G Vulcan/Zeus marine chartplotter displays."
+authors = ["Nash Kaminski <nashkaminski@kaminski.io>", "Hans <https://github.com/htool>"]
+readme = "README.md"
+packages = [{include = "navicoos_remote_client"}]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+python-mpv = "^1.0.1"
+pyobjc-framework-Cocoa = "^10.0"
+
+[tool.poetry.scripts]
+navicoos-remote-client = "navicoos_remote_client.cli:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

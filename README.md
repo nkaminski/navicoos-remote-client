@@ -1,23 +1,16 @@
-# BanGPlayer
+# navicoos-remote-client
 
 A native macOS remote display and control client for B&G Vulcan/Zeus marine chartplotter displays (and similar Navico devices).
 
 This application establishes a TCP connection to send control packets (mouse clicks, dragging, hardware key presses) to the MFD, and receives an ultra low-latency RTSP video stream mirroring the display.
 
-## Features
-
-- **Native macOS Cocoa Windowing**: Replaces legacy GStreamer/GTK dependencies with `NSApplication`, providing a seamless native macOS window experience.
-- **Ultra Low-Latency Streaming**: Configured `libmpv` with a zero-buffer profile and strictly untimed frames to achieve instantaneous video delivery.
-- **Hardware Key Passthrough**: Uses a global macOS Cocoa `NSEvent` monitor to intercept keyboard events silently (no "dings") and forward them to the MFD.
-- **Dynamic HiDPI Scaling**: Automatically detects Retina displays and adjusts the OSD window scaling and mouse coordinate transformations dynamically.
-- **Dynamic Protocol Discovery**: Parses the `ping` reply from the MFD to build a hardware keycode table specific to your exact device model dynamically.
 
 ## Prerequisites
 
-Ensure you have `python3` and the required macOS libraries installed:
+Ensure you have Poetry installed and the required macOS libraries:
 
 ```bash
-pip3 install python-mpv pyobjc-framework-Cocoa
+poetry install
 ```
 
 *Note: You also need `mpv` installed on your system (e.g., `brew install mpv`).*
@@ -27,7 +20,7 @@ pip3 install python-mpv pyobjc-framework-Cocoa
 Connect your Mac to the MFD's Wi-Fi network (or wired network), find the IP address of the MFD, and launch the player:
 
 ```bash
-python3 BanGPlayer.py <IP_ADDRESS>
+poetry run navicoos-remote-client <IP_ADDRESS>
 ```
 
 Optional arguments:
@@ -54,13 +47,13 @@ The MFD's physical hardware buttons are mapped to your Mac's keyboard:
 | `g` | Goto |
 | `a` | Mark |
 | `w` | WheelKey |
-| `q` | *Quit BanGPlayer* |
+| `q` | *Quit Client* |
 
 ---
 
 ## Technical Protocol Analysis
 
-`BanGPlayer.py` implements a custom binary TCP protocol on port `6633` over which control packets are exchanged.
+`navicoos-remote-client` implements a custom binary TCP protocol on port `6633` over which control packets are exchanged.
 
 ### Packet Structure
 All packets sent and received follow a strict binary format:
@@ -79,3 +72,14 @@ All packets sent and received follow a strict binary format:
   Includes a 32-bit monotonic timestamp, X/Y coordinates, an event type (`0x00` = press, `0x01` = drag, `0x02` = release), and a touch count (usually `1`).
 * **Key Events (`0x1003`)**:
   Includes the numerical keycode (derived dynamically from the Ping Reply) and a press state (`1` = press, `0` = release).
+
+### Video Stream
+The device broadcasts the screen mirror via an RTSP video stream located at `rtsp://<IP_ADDRESS>:554/screenmirror`. The client consumes this via `libmpv` configured for ultra-low latency.
+
+## Acknowledgements
+
+This project is a native macOS Cocoa rewrite and continuation based on the original [BanGPlayer](https://github.com/htool/BanGPlayer) by [htool](https://github.com/htool).
+
+## License
+
+This project is licensed under the MIT License.
