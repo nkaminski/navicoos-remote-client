@@ -1,221 +1,333 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
-import gi
 import logging
 import sys
 import socket
 import time
-import base64
-import time
 import argparse
+import struct
+import signal
+from typing import Dict, Tuple
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-gi.require_version('Gst', '1.0')
-from gi.repository import Gst
-
-mouseEvent = 0
-keyboardEvent = 0
-pressRelease = 0
-opcode = 0
+try:
+    import mpv
+    from Cocoa import NSApplication
+    from AppKit import NSEvent, NSKeyDown, NSEventMaskKeyDown, NSScreen
+except ImportError:
+    logging.error("Missing dependencies. Please ensure 'python-mpv' and 'pyobjc-framework-Cocoa' are installed.")
+    sys.exit(1)
 
 parser = argparse.ArgumentParser(description='Remote display for B&G Vulcan/Zeus MFD')
 parser.add_argument('IP', type=str, help='IP adress of Zeus/Vulcan MFD')
 parser.add_argument('-c', '--remotecontrold-port', default=6633, help='remotecontrold port number (6633)')
-parser.add_argument('-r', '--rstp-port', default=554, help='rstp port number (554)')
+parser.add_argument('-r', '--rtsp-port', default=554, help='rtsp port number (554)')
 parser.add_argument('-d', '--debug', action='store_true', help='debug mode')
+parser.add_argument('--client-id', type=str, default='00:11:22:33:44:55', help='Client MAC address for auth (e.g. 00:11:22:33:44:55)')
 args = vars(parser.parse_args())
 
-packets = {
-    'ping': 'AAYAAUQD18M=',
-    'auth': 'ACgAAwIAAAAAAGlQYWQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-    'bla1': 'AAkABAIAAAAAAAE=',
-    'bla2': 'AAkABAIAAAAAAAE=',
-    'bla3': 'AAwQAV/x4TUEgQMNAgE=',
-    'bla4': 'AAwQAV/x4TYEeAL6AAE=',
-    'bla5': 'AAwQAV/x4TYEeAL6AgE='
-}
+def build_auth_packet(mac_str: str, client_name: str = 'iPad') -> bytes:
+    """Build auth packet with client MAC address and name."""
+    mac_bytes = bytes.fromhex(mac_str.replace(':', ''))
+    if len(mac_bytes) != 6:
+        raise ValueError('MAC address must be 6 bytes (e.g. 00:11:22:33:44:55)')
+    payload = struct.pack('>H 6s 32s', 0x0003, mac_bytes, client_name.encode('ascii'))
+    return struct.pack('>H', len(payload)) + payload
+
+PING_PACKET: bytes = struct.pack('>H H I', 6, 1, 0x4403D7C3)
 
 if args['debug']:
-  logging.getLogger().setLevel(logging.DEBUG)
+    logging.getLogger().setLevel(logging.DEBUG)
 
-keyCodes = {
-    'Escape': 25, # page
-    'm': 50, # menu
-    'Up': 78, # zoomin
-    'Down': 74, # zoomout
-    'p': 16, # power
-    'Return': 28, # enter
-    'c': 1, # cancel
-    'g': 34, # goto
-    'a': 45, # mark
-    'o': 44 # mob
+# Static mapping: device button index -> (local keyboard key, function description)
+BUTTON_MAP: Dict[int, Tuple[str, str]] = {
+    0x01: ('Escape', 'Page'),
+    0x02: ('m', 'Menu'),
+    0x03: ('Up', 'Zoom In'),
+    0x04: ('Down', 'Zoom Out'),
+    0x05: ('p', 'Power'),
+    0x07: ('Return', 'Enter'),
+    0x08: ('c', 'Cancel'),
+    0x09: ('o', 'MOB'),
+    0x0a: ('g', 'Goto'),
+    0x0b: ('a', 'Mark'),
+    0x0c: ('w', 'WheelKey'),
 }
 
-print ("Mapped keycodes:\nEscape\t\tPage\nm\t\tMenu\nArrow Up\tZoom in\nArrow Down\tZoom out\np\t\tPower\nEnter\t\tEnter\nc\t\tCancel\ng\t\tGoto\na\t\tMark\no\t\tMOB\n")
+keyCodes: Dict[str, int] = {}
 
-def decode_ping(payload):
-    pingid = int.from_bytes(payload, "big")
-    return "ping request, id %d" % pingid
+def strip0(b: bytes) -> str:
+    """Strip null bytes from a byte string and decode to ASCII."""
+    return b.split(b"\x00", 1)[0].decode("ascii")
 
-def raw_payload(p):
-    return ' '.join(['%02x' % n for n in p])
+def parse_ping_reply(data: bytes) -> int:
+    """Parse ping reply to extract device info, keycodes, and resolution."""
+    global keyCodes
+    # Skip length (2) + opcode (2)
+    payload = data[4:]
+    pingid, str1_b, str2_b, version_b = struct.unpack_from('>I 32s 32s 24s', payload, 0)
+    str1 = strip0(str1_b)
+    str2 = strip0(str2_b)
+    version = strip0(version_b)
 
-def strip0(b):
-    l=''.join([chr(x) for x in b if x != 0])
-    return l
+    logging.info('Device: %s (%s), Version: %s' % (str1, str2, version))
 
-def decode_ping_reply(payload):
-    pingid = int.from_bytes(payload[0:4], "big")
-    stringlen=32
-    versionlen=24
-    str1=strip0(payload[4:4+stringlen])
-    str2=strip0(payload[4+stringlen:4+stringlen+stringlen])
-    version=strip0(payload[4+stringlen+stringlen:4+stringlen+stringlen+versionlen])
-    rest=payload[4+stringlen+stringlen+versionlen:]
-    return "ping reply, id %d, id1 is '%s', id2 is '%s', version is '%s', rest is %s" % (pingid, str1,str2,version,raw_payload(rest))
+    # Keycode table starts at payload offset 92
+    count = payload[92]
+    logging.info('Device reports %d buttons' % count)
 
-def decode_authenticate(payload):
-    pingid = int.from_bytes(payload[2:6], "big")
-    stringlen=32
-    str1=strip0(payload[6:6+stringlen])
-    return "authenticate: client id, id %d, id1 is '%s'" % (pingid, str1)
+    logging.info("Discovered keycodes from device:")
+    for i in range(count):
+        offset = 93 + i * 8
+        btn_index, keycode = struct.unpack_from('>I I', payload, offset)
 
-def touchbytes(t, x, y, tp, count):
-    opcode=0x1001
-    b = opcode.to_bytes(2, 'big') + t.to_bytes(4, 'big') + x.to_bytes(2, 'big') + y.to_bytes(2, 'big') + tp.to_bytes(1, 'big') + count.to_bytes(1, 'big')
-    b = len(b).to_bytes(2, 'big') + b
-    return b
+        if btn_index in BUTTON_MAP:
+            key, func = BUTTON_MAP[btn_index]
+            keyCodes[key] = keycode
+            logging.info("  %s\t\t%s\t(keycode %d)" % (key, func, keycode))
+        else:
+            logging.warning('  Unknown button index 0x%02x -> keycode %d' % (btn_index, keycode))
 
-def keybytes(keycode, pressRelease):
-    opcode=0x1003
-    b = opcode.to_bytes(2, 'big') + keycode.to_bytes(4, 'big') + pressRelease.to_bytes(4, 'big')
-    b = len(b).to_bytes(2, 'big') + b
-    return b
+    # Resolution follows the keycode table
+    res_offset = 93 + count * 8
+    if len(payload) >= res_offset + 4:
+        width, height = struct.unpack_from('>H H', payload, res_offset)
+        logging.info('Display resolution: %dx%d' % (width, height))
 
+    return pingid
 
-def on_event(pad, info):
-    global mouseEvent
-    global keyboardEvent
-    event = info.get_event()
-    type = event.type
-    pressRelease = 0
-    keyboardEvent = 0
-    if type == Gst.EventType.NAVIGATION:
-        e_struct = event.get_structure()
-        me = e_struct.get_string('event')
-        
-        # Catching key presses
-        if me == 'key-press':
-          if e_struct.has_field('key'):
-            pressRelease = 1
-            keyboardEvent = 1
+def touchbytes(timestamp: int, x_coord: int, y_coord: int, event_type: int, touch_count: int) -> bytes:
+    """Generate a touch event packet."""
+    payload = struct.pack('>H I H H B B', 0x1001, timestamp, x_coord, y_coord, event_type, touch_count)
+    return struct.pack('>H', len(payload)) + payload
 
-        if me == 'key-release':
-          if e_struct.has_field('key'):
-            pressRelease = 0
-            keyboardEvent = 1
- 
-        if keyboardEvent == 1:
-          key = e_struct.get_value('key')
-          logging.debug('Key event: %s' % key)
-          try:
-            keycode = keyCodes[key]
-            logging.debug('Keycode: %s' % keycode)
-            b=keybytes(keycode, pressRelease)
-            try:
-              s.send(b)
-            except socket.error as err:
-              logging.debug("Error sending data: %s" % err)
-          except:
-            logging.debug('Unmapped key')
+def keybytes(keycode: int, pressRelease: int) -> bytes:
+    """Generate a key event packet."""
+    payload = struct.pack('>H I I', 0x1003, keycode, pressRelease)
+    return struct.pack('>H', len(payload)) + payload
 
-        # Send event on press/release and move between press/release
-        if me == 'mouse-button-press':
-            x = int(e_struct.get_double('pointer_x')[1])
-            y = int(e_struct.get_double('pointer_y')[1])
-            mouseEvent = 1
-            e = 0
-        if me == 'mouse-button-release':
-            x = int(e_struct.get_double('pointer_x')[1])
-            y = int(e_struct.get_double('pointer_y')[1])
-            e = 2
-        if me == 'mouse-move':
-            x = int(e_struct.get_double('pointer_x')[1])
-            y = int(e_struct.get_double('pointer_y')[1])
-            e = 1
+# mpv key name -> keyCodes key mapping
+MPV_KEY_MAP: Dict[str, str] = {
+    'ESC': 'Escape',
+    'm': 'm',
+    'UP': 'Up',
+    'DOWN': 'Down',
+    'p': 'p',
+    'ENTER': 'Return',
+    'c': 'c',
+    'g': 'g',
+    'a': 'a',
+    'o': 'o',
+    'w': 'w',
+}
 
-        if mouseEvent == 1:
-            logging.debug('Event: %s x: %d y: %d' % (e, x, y))
-            b=touchbytes(int(time.time()),x,y,e,1)
-            try:
-                s.send(b)
-            except socket.error as err:
-                print("Error sending data: %s" % err)
-                # sys.exit(1)
-            if e == 2:
-                mouseEvent = 0
+NS_UP_ARROW: str = chr(0xF700)
+NS_DOWN_ARROW: str = chr(0xF701)
 
-    return Gst.PadProbeReturn.OK
+# Convert string keys directly instead of mapping numeric scancodes
+CHAR_TO_MPV: Dict[str, str] = {
+    '\x1b': 'ESC',
+    '\r': 'ENTER',
+}
 
+mouseDown: bool = False
 
+def handle_key_press(key_name: str) -> None:
+    """Handle a key press event from mpv, send press+release to device."""
+    mpv_key = key_name
+    mapped = MPV_KEY_MAP.get(mpv_key)
+    if mapped and mapped in keyCodes:
+        keycode = keyCodes[mapped]
+        logging.debug('Key press: %s -> keycode %d' % (mpv_key, keycode))
+        try:
+            s.send(keybytes(keycode, 1))  # press
+            s.send(keybytes(keycode, 0))  # release
+        except socket.error as err:
+            logging.error('Error sending key: %s' % err)
+    else:
+        logging.debug('Unmapped key: %s' % mpv_key)
+
+def handle_mouse(player: 'mpv.MPV', x: float, y: float, event_type: int) -> None:
+    """Send touch event to device. event_type: 0=press, 1=move, 2=release."""
+    try:
+        dims = player.osd_dimensions
+        if dims and dims.get('w', 0) > 0 and dims.get('h', 0) > 0:
+            ml = dims.get('ml', 0)
+            mr = dims.get('mr', 0)
+            mt = dims.get('mt', 0)
+            mb = dims.get('mb', 0)
+            w = dims.get('w', 1280)
+            h = dims.get('h', 720)
+            
+            video_w = w - ml - mr
+            video_h = h - mt - mb
+            
+            if video_w > 0 and video_h > 0:
+                nx = (x - ml) / video_w
+                ny = (y - mt) / video_h
+                ix = int(nx * 1280)
+                iy = int(ny * 720)
+            else:
+                ix = int(x * 1280 / w)
+                iy = int(y * 720 / h)
+        else:
+            vw = player.osd_width or 1280
+            vh = player.osd_height or 720
+            ix = int(x * 1280 / vw) if vw else int(x)
+            iy = int(y * 720 / vh) if vh else int(y)
+    except Exception:
+        ix = int(x)
+        iy = int(y)
+
+    ix = max(0, min(1279, ix))
+    iy = max(0, min(719, iy))
+    
+    logging.debug('Touch event=%d x=%d y=%d' % (event_type, ix, iy))
+    try:
+        s.send(touchbytes(int(time.monotonic() * 1000), ix, iy, event_type, 1))
+    except socket.error as err:
+        logging.error('Error sending touch: %s' % err)
 
 try:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-except socket.error as err:
-    print ("Error creating socket: %s" % err)
-    sys.exit(1)
-
-try:
     s.connect((args['IP'], args['remotecontrold_port']))
-except socket.gaierror as err:
-    print ("Address-related error connecting to server: %s" % err)
+    s.settimeout(10)
+    
+    logging.debug('Connecting to remotecontrold...')
+    s.send(PING_PACKET)
+    
+    # Receive ping reply and discover keycodes
+    ping_reply = s.recv(4096)
+    logging.debug('Ping reply: %d bytes' % len(ping_reply))
+    parse_ping_reply(ping_reply)
+    
+    # Build and send auth with client MAC
+    auth_pkt = build_auth_packet(args['client_id'])
+    logging.debug('Sending authenticate with MAC %s...' % args['client_id'])
+    
+    logging.debug('Auth packet: %s' % auth_pkt.hex(' '))
+    s.send(auth_pkt)
+    
+    # Receive auth acknowledgment
+    auth_ack = s.recv(4096)
+    logging.debug('Auth ack: %s' % auth_ack.hex(' '))
+    if len(auth_ack) >= 4:
+        ack_opcode = int.from_bytes(auth_ack[2:4], 'big')
+        if ack_opcode == 0x0004:
+            logging.debug('Auth acknowledged by device')
+        else:
+            logging.warning('Unexpected response opcode: 0x%04x' % ack_opcode)
+            
+except socket.timeout:
+    logging.warning("Network timeout waiting for device response")
+except socket.error:
+    logging.exception("Connection error")
     sys.exit(1)
-except socket.error as err:
-    print ("Connection error: %s" % err)
-    sys.exit(1)
 
+rtsp_url = f"rtsp://{args['IP']}:{args['rtsp_port']}/screenmirror"
+logging.info('Opening RTSP stream via Cocoa NSApplication: %s' % rtsp_url)
 
-time.sleep(1)
-logging.debug('Connecting to remotecontrold...')
-s.send(base64.b64decode(packets['ping']))
-time.sleep(1)
-logging.debug('Sending authenticate...')
-s.send(base64.b64decode(packets['auth']))
-logging.debug('Connected')
-s.send(base64.b64decode(packets['bla1']))
+app = NSApplication.sharedApplication()
 
-# initialize GStreamer
-Gst.init(None)
-# build the pipeline
+# Check if main screen is HiDPI (Retina)
+backing_scale = 1.0
+if 'NSScreen' in globals():
+    main_screen = NSScreen.mainScreen()
+    if main_screen:
+        backing_scale = main_screen.backingScaleFactor()
 
-pipeline = Gst.parse_launch('rtspsrc name=source latency=0 ! decodebin ! autovideosink')
-source = pipeline.get_by_name('source')
-source.props.location = 'rtsp://' + args['IP'] + ':' + str(args['rstp_port']) + '/screenmirror'
-
-#launch = "rtspsrc location=rtsp://" + args['IP'] + ":5554/screenmirror latency=1 !  rtph264depay ! h264parse ! autovideosink"
-#launch = "playbin uri=rtsp://localhost:8554/test uridecodebin0::source::latency=300 ! autovideosink"
-#    "videotestsrc ! navigationtest ! videoconvert ! ximagesink"
-#    "videotestsrc pattern=snow ! video/x-raw,width=1280,height=800 ! autovideosink"
-#pipeline = Gst.parse_launch(launch)
-# start playing
-
-pipeline.set_state(Gst.State.PLAYING)
-
-# for some reason no events from the vaapisink bin (first in the list), but the second bin (vaapih264dec) works OK
-bin = pipeline.children[1]
-# sink = 0, src = 1
-pad = bin.pads[0]
-#pad = pipeline.children[0]
-
-pad.add_probe(Gst.PadProbeType.EVENT_UPSTREAM, on_event)
-
-# wait until EOS or error
-bus = pipeline.get_bus()
-bus.add_signal_watch()
-# bus.set_title('B&G Player')
-
-msg = bus.timed_pop_filtered(
-    Gst.CLOCK_TIME_NONE,
-    Gst.MessageType.ERROR | Gst.MessageType.EOS
+player = mpv.MPV(
+    input_default_bindings=False,
+    input_vo_keyboard=False,
+    window_dragging=False,
+    osc=False,
+    title='B&G Remote Display',
+    profile='low-latency',
+    untimed=True,
+    cache='no',
+    video_margin_ratio_top=0.1,
+    window_scale=2.0 if backing_scale > 1.0 else 1.0,
+    log_handler=lambda level, component, message: logging.debug('[%s] %s', component, message),
+    loglevel='warn'
 )
+
+def global_key_handler(event: 'NSEvent') -> 'NSEvent':
+    """Global Cocoa key event monitor to intercept keys before they hit the window."""
+    if event.type() == NSKeyDown:
+        chars = event.charactersIgnoringModifiers()
+        if not chars:
+            return event
+        char = chars[0]
+        
+        if char == 'q':
+            logging.info('Quit requested')
+            player.quit()
+            return None
+            
+        if char == NS_UP_ARROW:
+            mpv_key = 'UP'
+        elif char == NS_DOWN_ARROW:
+            mpv_key = 'DOWN'
+        else:
+            mpv_key = CHAR_TO_MPV.get(char, char)
+            
+        if mpv_key in MPV_KEY_MAP:
+            handle_key_press(mpv_key)
+            return None
+    return event
+
+# NSEventMaskKeyDown = 1024
+NSEvent.addLocalMonitorForEventsMatchingMask_handler_(NSEventMaskKeyDown if 'NSEventMaskKeyDown' in globals() else 1024, global_key_handler)
+
+# Mouse event handling mimicking original GStreamer behavior
+@player.key_binding('MBTN_LEFT_DBL')
+@player.key_binding('MBTN_LEFT')
+def mouse_left_handler(state: str = 'p-', name: str = None, char: str = None, *_) -> None:
+    global mouseDown
+    is_down = (state[0] == 'd')
+    is_up = (state[0] == 'u')
+    is_press = (state[0] == 'p')
+
+    if is_down or is_press:
+        mouseDown = True
+        try:
+            mx = player.mouse_pos['x']
+            my = player.mouse_pos['y']
+            handle_mouse(player, mx, my, 0)
+        except Exception as e:
+            logging.debug('Mouse press error: %s' % e)
+    
+    if is_up or is_press:
+        try:
+            mx = player.mouse_pos['x']
+            my = player.mouse_pos['y']
+            handle_mouse(player, mx, my, 2)
+        except Exception as e:
+            logging.debug('Mouse release error: %s' % e)
+        mouseDown = False
+
+@player.property_observer('mouse-pos')
+def on_mouse_move(name: str, value: Dict[str, float]) -> None:
+    global mouseDown
+    if mouseDown and value:
+        mx = value.get('x', 0)
+        my = value.get('y', 0)
+        handle_mouse(player, mx, my, 1)
+
+@player.event_callback('file-loaded')
+def on_file_loaded(event: Dict) -> None:
+    logging.info('Stream connected and playing')
+    
+@player.event_callback('shutdown')
+@player.event_callback('end-file')
+def stop_app(evt: Dict) -> None:
+    logging.info('Shutting down Cocoa app')
+    s.close()
+    app.terminate_(None)
+
+player.play(rtsp_url)
+
+# Allow Ctrl+C in terminal to instantly kill the Cocoa app
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+app.run()

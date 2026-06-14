@@ -1,31 +1,81 @@
 # BanGPlayer
 
-Connect to your B&G Vulcan/Zeus from a laptop and use your mouse to control it.
-For a new connection you'll need to 'ack' the new connectioned on the MFD.
+A native macOS remote display and control client for B&G Vulcan/Zeus marine chartplotter displays (and similar Navico devices).
 
+This application establishes a TCP connection to send control packets (mouse clicks, dragging, hardware key presses) to the MFD, and receives an ultra low-latency RTSP video stream mirroring the display.
+
+## Features
+
+- **Native macOS Cocoa Windowing**: Replaces legacy GStreamer/GTK dependencies with `NSApplication`, providing a seamless native macOS window experience.
+- **Ultra Low-Latency Streaming**: Configured `libmpv` with a zero-buffer profile and strictly untimed frames to achieve instantaneous video delivery.
+- **Hardware Key Passthrough**: Uses a global macOS Cocoa `NSEvent` monitor to intercept keyboard events silently (no "dings") and forward them to the MFD.
+- **Dynamic HiDPI Scaling**: Automatically detects Retina displays and adjusts the OSD window scaling and mouse coordinate transformations dynamically.
+- **Dynamic Protocol Discovery**: Parses the `ping` reply from the MFD to build a hardware keycode table specific to your exact device model dynamically.
+
+## Prerequisites
+
+Ensure you have `python3` and the required macOS libraries installed:
+
+```bash
+pip3 install python-mpv pyobjc-framework-Cocoa
 ```
-$ ./BanGPlayer.py -h
-usage: BanGPlayer.py [-h] [-c REMOTECONTROLD_PORT] [-r RSTP_PORT] [-d] IP
 
-Remote display for B&G Vulcan/Zeus MFD
+*Note: You also need `mpv` installed on your system (e.g., `brew install mpv`).*
 
-positional arguments:
-  IP                    IP adress of Zeus/Vulcan MFD
+## Usage
 
-optional arguments:
-  -h, --help            show this help message and exit
-  -c REMOTECONTROLD_PORT, --remotecontrold-port REMOTECONTROLD_PORT
-                        remotecontrold port number (6633)
-  -r RSTP_PORT, --rstp-port RSTP_PORT
-                        rstp port number (554)
-  -d, --debug           debug mode
+Connect your Mac to the MFD's Wi-Fi network (or wired network), find the IP address of the MFD, and launch the player:
+
+```bash
+python3 BanGPlayer.py <IP_ADDRESS>
 ```
 
-# Issues
-On Ubunutu at some point I got a black screen. VLC also showed a black screen.
-Using a SNAP version of VLC made it work for VLC.
+Optional arguments:
+- `--client-id 00:11:22:33:44:55`: Provide your Mac's MAC address to avoid authorization re-prompts on the MFD.
+- `--debug`: Enable verbose packet logging.
+- `-c`, `-r`: Override remotecontrol/RTSP ports if necessary.
 
-$ apt-gegt remove gstreamer1.0-vaapi
+When connecting to an MFD for the first time, you must tap **Accept** on the physical MFD screen to authorize the connection.
 
-was required to make it work again for this script.
+## Keyboard Controls
 
+The MFD's physical hardware buttons are mapped to your Mac's keyboard:
+
+| Mac Key | MFD Hardware Button |
+|---------|---------------------|
+| `Esc` | Pages |
+| `m` | Menu |
+| `Up Arrow` | Zoom In |
+| `Down Arrow` | Zoom Out |
+| `p` | Power |
+| `Enter` | Enter |
+| `c` | Cancel |
+| `o` | MOB |
+| `g` | Goto |
+| `a` | Mark |
+| `w` | WheelKey |
+| `q` | *Quit BanGPlayer* |
+
+---
+
+## Technical Protocol Analysis
+
+`BanGPlayer.py` implements a custom binary TCP protocol on port `6633` over which control packets are exchanged.
+
+### Packet Structure
+All packets sent and received follow a strict binary format:
+1. **Length** (2 bytes): Total length of the payload
+2. **Opcode** (2 bytes): Identifies the action type (e.g., Ping, Auth, Touch)
+3. **Payload Data**: Variable length
+
+### Handshake Sequence
+1. **Ping Request (`0x0001`)**: The client sends a hardcoded Ping ID (`0x4403D7C3`).
+2. **Ping Reply (`0x0002`)**: The MFD responds with its device identity string, software version, display resolution (e.g., 1280x720), and an array of hardware button indices mapped to numerical keycodes.
+3. **Auth Request (`0x0003`)**: The client sends its MAC address (6 bytes) and an ASCII string name (null-padded to 32 bytes, e.g., `"iPad"`).
+4. **Auth Ack (`0x0004`)**: The MFD echoes back the MAC address and an `0x01` success flag to complete the handshake. (Older versions of the script incorrectly sent static `bla1` and `bla2` packets instead of waiting for this response).
+
+### Interaction Packets
+* **Touch Events (`0x1001`)**:
+  Includes a 32-bit monotonic timestamp, X/Y coordinates, an event type (`0x00` = press, `0x01` = drag, `0x02` = release), and a touch count (usually `1`).
+* **Key Events (`0x1003`)**:
+  Includes the numerical keycode (derived dynamically from the Ping Reply) and a press state (`1` = press, `0` = release).
