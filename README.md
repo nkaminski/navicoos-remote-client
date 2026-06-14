@@ -65,7 +65,7 @@ All packets sent and received follow a strict binary format:
 1. **Ping Request (`0x0001`)**: The client sends a hardcoded Ping ID (`0x4403D7C3`).
 2. **Ping Reply (`0x0002`)**: The MFD responds with its device identity string, software version, display resolution (e.g., 1280x720), and an array of hardware button indices mapped to numerical keycodes.
 3. **Auth Request (`0x0003`)**: The client sends its MAC address (6 bytes) and an ASCII string name (null-padded to 32 bytes, e.g., `"iPad"`).
-4. **Auth Ack (`0x0004`)**: The MFD echoes back the MAC address and an `0x01` success flag to complete the handshake. (Older versions of the script incorrectly sent static `bla1` and `bla2` packets instead of waiting for this response).
+4. **Auth Ack (`0x0004`)**: The MFD echoes back the MAC address and an `0x01` success flag to complete the handshake. (Older versions of the script incorrectly sent additional static packets instead of waiting for this response).
 
 ### Interaction Packets
 * **Touch Events (`0x1001`)**:
